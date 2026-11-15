@@ -118,11 +118,60 @@ fn subtitles_round_trip() {
 // network (ignored by default)
 // ---------------------------------------------------------------------------
 
+/// Did Google serve its "Sorry, unusual traffic" page instead of an answer?
+///
+/// The CI runners are datacentre addresses and get refused now and then.
+/// That is not a bug in the code, so the test skips instead of failing.
+fn is_bot_check(error: &str) -> bool {
+    let text = error.to_ascii_lowercase();
+    text.contains("403 forbidden")
+        || text.contains("sorry")
+        || text.contains("unusual traffic")
+        || text.contains("429")
+}
+
+/// Try a few times, because the API is rate limited.
+async fn with_retries<T, F, Fut>(mut call: F) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let mut last = String::new();
+    for attempt in 0..3 {
+        match call().await {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                if is_bot_check(&e) {
+                    last = e;
+                    tokio::time::sleep(std::time::Duration::from_secs(5 * (attempt + 1))).await;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+    Err(last)
+}
+
 #[tokio::test]
 #[ignore = "hits the network"]
 async fn fetches_a_real_video() {
-    let it = InnerTube::new(ClientContext::android()).unwrap();
-    let player = player::fetch(&it, "dQw4w9WgXcQ").await.unwrap();
+    let player = with_retries(|| async {
+        let it = InnerTube::new(ClientContext::android()).unwrap();
+        player::fetch(&it, "dQw4w9WgXcQ")
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .await;
+
+    let player = match player {
+        Ok(player) => player,
+        Err(e) if is_bot_check(&e) => {
+            eprintln!("skipping: Google refused this address ({e})");
+            return;
+        }
+        Err(e) => panic!("{e}"),
+    };
 
     assert_eq!(player.playability_status.status, "OK");
     let formats = player::all_formats(player.streaming_data.as_ref().unwrap());
@@ -144,10 +193,24 @@ async fn fetches_a_real_video() {
 #[ignore = "hits the network"]
 async fn lists_a_playlist() {
     use ytgrab::innertube::browse;
-    let it = InnerTube::new(ClientContext::android()).unwrap();
-    let items = browse::playlist(&it, "PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb")
-        .await
-        .unwrap();
+
+    let items = with_retries(|| async {
+        let it = InnerTube::new(ClientContext::android()).unwrap();
+        browse::playlist(&it, "PLbpi6ZahtOH6Blw3RGYpWkSByi_T7Rygb")
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .await;
+
+    let items = match items {
+        Ok(items) => items,
+        Err(e) if is_bot_check(&e) => {
+            eprintln!("skipping: Google refused this address ({e})");
+            return;
+        }
+        Err(e) => panic!("{e}"),
+    };
+
     assert!(!items.is_empty());
     assert!(items.iter().all(|i| i.video_id.len() == 11));
 }
