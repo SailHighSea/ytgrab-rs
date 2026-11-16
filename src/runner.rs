@@ -244,6 +244,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         Target::Playlist { id } => {
             download_playlist(&it, &dl, &cli, &id, jar.clone(), archive.as_ref()).await
         }
+        Target::Channel { url, tab } => {
+            download_channel(&it, &dl, &cli, &url, tab, jar.clone(), archive.as_ref()).await
+        }
     }
 }
 
@@ -271,7 +274,94 @@ async fn download_playlist(
         title: String::new(),
         index: None,
     };
+    download_items(it, dl, cli, &items, &ctx, archive, jar).await
+}
 
+/// Download everything a channel has.
+///
+/// The videos of a channel are the "uploads" playlist, which is the channel id
+/// with `UC` swapped for `UU`.
+async fn download_channel(
+    it: &InnerTube,
+    dl: &Downloader,
+    cli: &Cli,
+    url: &str,
+    tab: crate::url::ChannelTab,
+    jar: Option<std::sync::Arc<reqwest::cookie::Jar>>,
+    archive: Option<&crate::archive::Archive>,
+) -> Result<()> {
+    use crate::url::ChannelTab;
+
+    let channel = browse::resolve_channel(it, url).await?;
+    if !cli.quiet {
+        eprintln!("Channel {} ({})", channel.id, url);
+    }
+
+    let ctx = PlaylistContext {
+        id: channel.id.clone(),
+        title: String::new(),
+        index: None,
+    };
+
+    match tab {
+        ChannelTab::Playlists => {
+            // Browsing a channel page needs a PO token these days, so fall
+            // back to reading the playlists off the page itself.
+            let mut playlists = browse::channel_playlists(it, &channel.id, &channel.params)
+                .await
+                .unwrap_or_default();
+            if playlists.is_empty() {
+                let http = reqwest::Client::builder()
+                    .user_agent(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+                    )
+                    .build()?;
+                let page_url = format!("{}/playlists", url.trim_end_matches('/'));
+                let data = crate::innertube::web::fetch_initial_data(&http, &page_url).await?;
+                playlists = browse::playlists_from_page(&data);
+            }
+            if playlists.is_empty() {
+                return Err(Error::other(
+                    "YouTube did not return the playlists of this channel",
+                ));
+            }
+            if !cli.quiet {
+                eprintln!("Found {} playlists", playlists.len());
+            }
+            for (playlist_id, title) in playlists {
+                if !cli.quiet {
+                    eprintln!("Playlist: {title}");
+                }
+                let items = browse::playlist(it, &playlist_id).await?;
+                let playlist_ctx = PlaylistContext {
+                    id: playlist_id,
+                    title,
+                    index: None,
+                };
+                download_items(it, dl, cli, &items, &playlist_ctx, archive, jar.clone()).await?;
+            }
+            Ok(())
+        }
+        ChannelTab::Videos | ChannelTab::Shorts | ChannelTab::Streams => {
+            let items = browse::channel_videos(it, &channel.id).await?;
+            if items.is_empty() {
+                return Err(Error::other("this channel has no videos"));
+            }
+            download_items(it, dl, cli, &items, &ctx, archive, jar).await
+        }
+    }
+}
+
+/// Download a list of videos, honouring the playlist selectors.
+async fn download_items(
+    it: &InnerTube,
+    dl: &Downloader,
+    cli: &Cli,
+    items: &[browse::PlaylistItem],
+    ctx: &PlaylistContext,
+    archive: Option<&crate::archive::Archive>,
+    jar: Option<std::sync::Arc<reqwest::cookie::Jar>>,
+) -> Result<()> {
     let mut failures = 0;
     let mut tv = TvSource::new(jar, cli.no_cache_dir);
 

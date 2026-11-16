@@ -11,6 +11,34 @@ pub enum Target {
     Playlist {
         id: String,
     },
+    /// A channel: a handle, a vanity name or a channel id.
+    Channel {
+        /// The part of the URL that identifies the channel.
+        url: String,
+        /// Which tab of the channel.
+        tab: ChannelTab,
+    },
+}
+
+/// The tabs of a channel that can be listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelTab {
+    Videos,
+    Playlists,
+    Shorts,
+    Streams,
+}
+
+impl ChannelTab {
+    pub fn from_path(segment: &str) -> Option<Self> {
+        match segment {
+            "videos" | "featured" => Some(ChannelTab::Videos),
+            "playlists" => Some(ChannelTab::Playlists),
+            "shorts" => Some(ChannelTab::Shorts),
+            "streams" | "live" => Some(ChannelTab::Streams),
+            _ => None,
+        }
+    }
 }
 
 /// A bare 11-character YouTube id.
@@ -91,6 +119,37 @@ pub fn parse(input: &str) -> Result<Target> {
                         return Ok(Target::Playlist { id: list });
                     }
                 }
+                Some(handle) if handle.starts_with('@') => {
+                    // A channel, possibly with a tab.
+                    let tab = segments
+                        .get(1)
+                        .and_then(|s| ChannelTab::from_path(s))
+                        .unwrap_or(ChannelTab::Videos);
+                    return Ok(Target::Channel {
+                        url: format!("https://www.youtube.com/{}", segments[0]),
+                        tab,
+                    });
+                }
+                Some("channel") => {
+                    let tab = segments
+                        .get(2)
+                        .and_then(|s| ChannelTab::from_path(s))
+                        .unwrap_or(ChannelTab::Videos);
+                    return Ok(Target::Channel {
+                        url: format!("https://www.youtube.com/channel/{}", segments[1]),
+                        tab,
+                    });
+                }
+                Some("c") | Some("user") => {
+                    let tab = segments
+                        .get(2)
+                        .and_then(|s| ChannelTab::from_path(s))
+                        .unwrap_or(ChannelTab::Videos);
+                    return Ok(Target::Channel {
+                        url: format!("https://www.youtube.com/{}/{}", segments[0], segments[1]),
+                        tab,
+                    });
+                }
                 _ => {}
             }
             if let Some(id) = video_id {
@@ -151,6 +210,43 @@ mod tests {
     #[test]
     fn parses_bare_id() {
         assert!(matches!(parse("dQw4w9WgXcQ").unwrap(), Target::Video { .. }));
+    }
+
+    #[test]
+    fn parses_channel_urls() {
+        let cases = [
+            ("https://www.youtube.com/@YouTube", "https://www.youtube.com/@YouTube"),
+            // The host is normalised.
+            ("https://youtube.com/@Some-Handle", "https://www.youtube.com/@Some-Handle"),
+            (
+                "https://www.youtube.com/channel/UCBR8-60-B28hp2BmDPdntcQ",
+                "https://www.youtube.com/channel/UCBR8-60-B28hp2BmDPdntcQ",
+            ),
+            ("https://www.youtube.com/c/SomeName", "https://www.youtube.com/c/SomeName"),
+            ("https://www.youtube.com/user/SomeName", "https://www.youtube.com/user/SomeName"),
+        ];
+        for (input, expected) in cases {
+            match parse(input).unwrap() {
+                Target::Channel { url, .. } => assert_eq!(url, expected, "for {input}"),
+                other => panic!("expected a channel for {input}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parses_channel_tabs() {
+        match parse("https://www.youtube.com/@YouTube/playlists").unwrap() {
+            Target::Channel { tab, .. } => assert_eq!(tab, ChannelTab::Playlists),
+            other => panic!("expected a channel, got {other:?}"),
+        }
+        match parse("https://www.youtube.com/@YouTube/videos").unwrap() {
+            Target::Channel { tab, .. } => assert_eq!(tab, ChannelTab::Videos),
+            other => panic!("expected a channel, got {other:?}"),
+        }
+        match parse("https://www.youtube.com/@YouTube").unwrap() {
+            Target::Channel { tab, .. } => assert_eq!(tab, ChannelTab::Videos),
+            other => panic!("expected a channel, got {other:?}"),
+        }
     }
 
     #[test]

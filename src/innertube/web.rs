@@ -164,6 +164,67 @@ fn find_json_end(html: &str, start: usize) -> Option<usize> {
     None
 }
 
+/// Fetch a page and return the `ytInitialData` it carries.
+pub async fn fetch_initial_data(http: &Client, url: &str) -> Result<Value> {
+    let html = http
+        .get(url)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+        )
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    extract_initial_data(&html)
+}
+
+/// Pull `ytInitialData` out of a page.
+pub fn extract_initial_data(html: &str) -> Result<Value> {
+    const MARKER: &str = "var ytInitialData = ";
+    let Some(start) = html.find(MARKER) else {
+        return Err(Error::other("the page did not contain any data"));
+    };
+    let body = &html[start + MARKER.len()..];
+    let end = json_object_end(body)
+        .ok_or_else(|| Error::other("could not find the end of the page data"))?;
+    serde_json::from_str(&body[..end]).map_err(Error::Json)
+}
+
+/// The index just past the JSON object that starts the string.
+fn json_object_end(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, b) in bytes.iter().enumerate() {
+        let c = *b as char;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Find the upload date in the page.
 fn extract_upload_date(html: &str) -> Option<String> {
     let marker = "\"uploadDate\":\"";

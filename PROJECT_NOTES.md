@@ -267,6 +267,19 @@ connections on purpose.
 * **Size verification.** A download that stops early is now reported
   instead of being muxed into a broken file.
 
+## Channels
+
+Channel URLs are resolved with the `navigation/resolve_url` endpoint, which
+turns `@handle`, `/c/Name` and `/user/Name` into the `UC...` id.
+
+The videos of a channel are its *uploads* playlist, which is the channel id
+with `UC` swapped for `UU` — and it comes back in exactly the same shape as a
+normal playlist, so the playlist code is reused as is.
+
+Browsing a channel *page* (the playlists tab) through the API now needs a PO
+token and answers `400 INVALID_ARGUMENT` for every client, so that tab is
+read off the page's `ytInitialData` instead.
+
 ## The yt-dlp parity batch
 
 * `--exec` and `--exec-before-download` — run a shell command per video, with

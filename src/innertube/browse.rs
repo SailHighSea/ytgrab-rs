@@ -7,7 +7,7 @@
 
 use serde_json::{json, Value};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::innertube::client::InnerTube;
 
 #[derive(Debug, Clone)]
@@ -136,4 +136,170 @@ fn collect_items(raw: &Value) -> Vec<PlaylistItem> {
             })
         })
         .collect()
+}
+
+/// A channel that has been resolved to its id.
+#[derive(Debug, Clone)]
+pub struct Channel {
+    /// The `UC...` id.
+    pub id: String,
+    /// The tab parameters the resolver handed back.
+    pub params: String,
+}
+
+/// Resolve a channel URL (`@handle`, `/c/Name`, `/user/Name`, `/channel/UC...`)
+/// to its channel id.
+pub async fn resolve_channel(it: &InnerTube, url: &str) -> Result<Channel> {
+    let mut body = it.context_object().await;
+    body["url"] = serde_json::json!(url);
+
+    let raw = it.post("navigation/resolve_url", body).await?;
+    let browse_id = raw
+        .get("endpoint")
+        .and_then(|e| e.get("browseEndpoint"))
+        .and_then(|b| b.get("browseId"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Unavailable(format!("could not resolve the channel `{url}`")))?
+        .to_string();
+    let params = raw
+        .get("endpoint")
+        .and_then(|e| e.get("browseEndpoint"))
+        .and_then(|b| b.get("params"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    Ok(Channel { id: browse_id, params })
+}
+
+/// The playlist that holds every video a channel uploaded.
+///
+/// It is the channel id with `UC` swapped for `UU`.
+pub fn uploads_playlist_id(channel_id: &str) -> String {
+    if let Some(rest) = channel_id.strip_prefix("UC") {
+        format!("UU{rest}")
+    } else {
+        channel_id.to_string()
+    }
+}
+
+/// The videos of a channel, in the same shape as a playlist.
+pub async fn channel_videos(it: &InnerTube, channel_id: &str) -> Result<Vec<PlaylistItem>> {
+    let playlist_id = uploads_playlist_id(channel_id);
+    playlist(it, &playlist_id).await
+}
+
+/// The playlists of a channel.
+pub async fn channel_playlists(
+    it: &InnerTube,
+    channel_id: &str,
+    params: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut body = it.context_object().await;
+    body["browseId"] = serde_json::json!(channel_id);
+    if !params.is_empty() {
+        body["params"] = serde_json::json!(params);
+    }
+
+    let raw = it.post("browse", body).await?;
+    let mut out = Vec::new();
+    collect_playlists(&raw, &mut out);
+
+    if out.is_empty() {
+        // The playlists tab needs its own parameters; try the encoded form.
+        for candidate in ["EgIQABABGAA", "EgZ2aWRlb3PyBgQKAjIA", "EgIQAg%3D%3D"] {
+            let mut body = it.context_object().await;
+            body["browseId"] = serde_json::json!(channel_id);
+            body["params"] = serde_json::json!(candidate);
+            if let Ok(raw) = it.post("browse", body).await {
+                collect_playlists(&raw, &mut out);
+                if !out.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// The playlists of a channel, taken from the channel page.
+///
+/// Browsing a channel page through the API needs a PO token now, so the
+/// page itself is parsed instead.
+pub fn playlists_from_page(data: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    collect_lockups(data, &mut out);
+    out
+}
+
+/// Walk the page data looking for the playlist entries.
+fn collect_lockups(value: &Value, out: &mut Vec<(String, String)>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(id) = map.get("contentId").and_then(|c| c.as_str()) {
+                if id.starts_with("PL") {
+                    let title = map
+                        .get("metadata")
+                        .and_then(|m| m.get("lockupMetadataViewModel"))
+                        .and_then(|m| m.get("title"))
+                        .and_then(|t| t.get("content"))
+                        .and_then(|c| c.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if !out.iter().any(|(existing, _)| existing == id) {
+                        out.push((id.to_string(), title));
+                    }
+                }
+            }
+            for v in map.values() {
+                collect_lockups(v, out);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                collect_lockups(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Pull the playlists out of a browse response.
+fn collect_playlists(value: &Value, out: &mut Vec<(String, String)>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(renderer) = map.get("playlistRenderer") {
+                let id = renderer.get("playlistId").and_then(|v| v.as_str()).unwrap_or("");
+                let title = renderer
+                    .get("title")
+                    .map(|t| {
+                        t.get("runs")
+                            .and_then(|r| r.as_array())
+                            .map(|runs| {
+                                runs.iter()
+                                    .filter_map(|r| r.get("text").and_then(|t| t.as_str()))
+                                    .collect::<String>()
+                            })
+                            .or_else(|| {
+                                t.get("simpleText").and_then(|t| t.as_str()).map(str::to_string)
+                            })
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                if !id.is_empty() {
+                    out.push((id.to_string(), title));
+                }
+            }
+            for v in map.values() {
+                collect_playlists(v, out);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                collect_playlists(v, out);
+            }
+        }
+        _ => {}
+    }
 }
