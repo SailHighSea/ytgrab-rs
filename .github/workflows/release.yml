@@ -1,0 +1,162 @@
+name: Release
+
+# A release is made whenever the version in Cargo.toml has no tag yet.
+# Workflow: bump `version` in Cargo.toml, commit, push from GitHub Desktop.
+# Pushing a tag like v0.3.0 by hand works too, and so does "Run workflow".
+#
+# Pushing to the `dev` branch publishes a numbered pre-release instead:
+# v<version>-dev1, v<version>-dev2, ... (one per push), to try the builds
+# before a real release.
+on:
+  push:
+    branches: [main, dev]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check version
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.v.outputs.release }}
+      tag: ${{ steps.v.outputs.tag }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: v
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          tag="v$version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == "refs/heads/dev" ]]; then
+            # Dev builds always release, numbered after the highest existing
+            # v<version>-devN tag.
+            last=$(git tag -l "v$version-dev*" | sed "s/^v$version-dev//" | sort -n | tail -1)
+            echo "tag=v$version-dev$(( ${last:-0} + 1 ))" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            # A tag push always releases that tag.
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          elif git rev-parse -q --verify "refs/tags/$tag" >/dev/null \
+               && [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
+            echo "Tag $tag already exists, nothing to release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: build (${{ matrix.name }})
+    needs: check
+    if: needs.check.outputs.release == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: zip
+          - name: windows-arm64
+            # Native ARM runner: free for public repos only.
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            ext: zip
+          - name: linux-x86_64
+            # An older runner keeps the glibc requirement low.
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            ext: tar.gz
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            ext: tar.gz
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            ext: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          name="ytgrab-${TAG}-${{ matrix.name }}"
+          mkdir "$name"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "target/${{ matrix.target }}/release/ytgrab.exe" "$name/"
+          else
+            cp "target/${{ matrix.target }}/release/ytgrab" "$name/"
+          fi
+          cp README.md LICENSE "$name/"
+          if [[ "${{ matrix.ext }}" == "zip" ]]; then
+            7z a "$name.zip" "$name" >/dev/null
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$name.${{ matrix.ext }}" > "$name.${{ matrix.ext }}.sha256"
+          else
+            shasum -a 256 "$name.${{ matrix.ext }}" > "$name.${{ matrix.ext }}.sha256"
+          fi
+          echo "ASSET=$name.${{ matrix.ext }}" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
+
+  publish:
+    name: publish release
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check.outputs.tag }}
+          PRERELEASE: ${{ needs.check.outputs.prerelease }}
+        run: |
+          ls -l dist
+          if [[ "$PRERELEASE" == "true" ]]; then
+            gh release create "$TAG" dist/* \
+              --target "$GITHUB_SHA" \
+              --title "ytgrab $TAG" \
+              --notes "Development build of $(git rev-parse --short HEAD). Not a stable release." \
+              --prerelease
+          elif gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --target "$GITHUB_SHA" \
+              --title "ytgrab $TAG" \
+              --generate-notes
+          fi

@@ -83,7 +83,7 @@ pub struct Cli {
     #[arg(long, value_name = "BROWSER")]
     pub cookies_from_browser: Option<String>,
 
-    /// InnerTube client to use: android, ios, mweb, web, tv
+    /// InnerTube client to use: android, android_vr, ios, mweb, web, tv
     #[arg(long, default_value = "android")]
     pub client: String,
 

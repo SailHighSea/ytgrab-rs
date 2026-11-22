@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 
 /// Numeric client ids used by the `X-Youtube-Client-Name` header.
 const CLIENT_ID_ANDROID: u32 = 3;
+const CLIENT_ID_ANDROID_VR: u32 = 28;
 const CLIENT_ID_IOS: u32 = 5;
 const CLIENT_ID_MWEB: u32 = 2;
 const CLIENT_ID_WEB: u32 = 1;
@@ -65,6 +66,29 @@ impl ClientContext {
                 "androidSdkVersion": 34,
                 "osName": "Android",
                 "osVersion": "14",
+            }),
+        }
+    }
+
+    /// ANDROID_VR (Oculus Quest): unciphered URLs that, unlike the ANDROID
+    /// client's, are not cut off after the first ~10 MiB without a PO token.
+    pub fn android_vr() -> Self {
+        Self {
+            name: "ANDROID_VR",
+            version: "1.60.19",
+            user_agent: "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+            api_key: "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w",
+            numeric_id: CLIENT_ID_ANDROID_VR,
+            visitor_data: None,
+            use_api_key: true,
+            signature_timestamp: None,
+            proxy: None,
+            extra: json!({
+                "deviceMake": "Oculus",
+                "deviceModel": "Quest 3",
+                "androidSdkVersion": 32,
+                "osName": "Android",
+                "osVersion": "12L",
             }),
         }
     }
@@ -160,6 +184,7 @@ impl ClientContext {
     pub fn by_name(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "android" => Some(Self::android()),
+            "android_vr" | "vr" => Some(Self::android_vr()),
             "ios" => Some(Self::ios()),
             "mweb" => Some(Self::mweb()),
             "web" => Some(Self::web()),

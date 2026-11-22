@@ -198,6 +198,18 @@ pub async fn run(cli: Cli) -> Result<()> {
     let mut ctx = ctx;
     ctx.proxy = cli.proxy.clone();
 
+    // The VR client gets a bot check without a visitor id, so take one from
+    // a watch page first.
+    if ctx.name == "ANDROID_VR" && ctx.visitor_data.is_none() {
+        if let Target::Video { id, .. } = &target {
+            let http = reqwest::Client::new();
+            if let Ok(watch) = crate::innertube::web::fetch(&http, id).await {
+                if !watch.visitor_data.is_empty() {
+                    ctx.visitor_data = Some(watch.visitor_data);
+                }
+            }
+        }
+    }
     let it = InnerTube::with_cookie_jar(ctx, jar.clone())?;
 
     // The archive of already downloaded videos.
@@ -492,7 +504,12 @@ async fn download_video(
             return Ok(DownloadOutcome::Skipped);
         }
 
-        let details = player.video_details.clone().unwrap_or_default();
+        let mut details = player.video_details.clone().unwrap_or_default();
+        // Some responses (the TV client's) leave the title out, which would
+        // name the file just ".mkv". Use the video id instead.
+        if details.title.trim().is_empty() {
+            details.title = video_id.to_string();
+        }
 
         // Only download videos whose title matches the filter.
         if let Some(filter) = &cli.match_filter {

@@ -4,3 +4,7 @@
 *.part.seg*
 *.lock
 *.info.json
+
+# Local-only: Windows test builds, build script, and Claude instructions
+/tests/win-test/
+/CLAUDE.md

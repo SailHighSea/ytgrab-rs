@@ -1,17 +1,19 @@
 //! Reading cookies out of a Chromium-based browser (Chrome, Brave, Chromium,
-//! Edge) and out of Firefox.
+//! Edge) and out of Firefox, on Linux, macOS and Windows.
 //!
-//! Chromium encrypts cookie values on disk. Two schemes matter:
+//! Chromium encrypts cookie values on disk, and how depends on the OS:
 //!
-//! * **v10** — the AES-128-CBC key is `PBKDF2-HMAC-SHA1(password, "saltysalt",
-//!   1 iteration, 16 bytes)`, where the password comes from the OS keyring
-//!   ("Chrome Safe Storage" / "Brave Safe Storage" / ...).
-//! * **v11** — `Local State` carries `os_crypt.encrypted_key`; the keyring
-//!   password is used directly as the AES key to decrypt it.
+//! * **Linux** — `v10`/`v11`: AES-128-CBC. The key is
+//!   `PBKDF2-HMAC-SHA1(password, "saltysalt", 1 iteration)`, where the
+//!   password comes from the keyring (`secret-tool`, needs a D-Bus session).
+//! * **macOS** — `v10`: AES-128-CBC, same scheme but 1003 iterations, and the
+//!   password comes from the Keychain (`security find-generic-password`).
+//! * **Windows** — `v10`: AES-256-GCM. The key is in `Local State`
+//!   (`os_crypt.encrypted_key`), protected with DPAPI, which we unwrap
+//!   through PowerShell. `v20` (app-bound, Chrome 127+) cookies can only be
+//!   read by Chrome itself and are skipped.
 //!
-//! On Linux the keyring is reached through `secret-tool` (libsecret), which
-//! needs a running D-Bus session. When it is not reachable we say so rather
-//! than failing cryptically.
+//! Firefox stores cookies unencrypted on every OS.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -40,31 +42,41 @@ pub struct BrowserCookie {
 struct BrowserProfile {
     /// Directory holding `Local State` and the profile folders.
     root: PathBuf,
-    /// Name of the keyring entry that holds the encryption password.
+    /// Name of the keyring / Keychain entry that holds the password
+    /// (Linux and macOS).
     keyring_app: String,
 }
 
 impl BrowserProfile {
     fn detect(browser: &str) -> Result<BrowserProfile> {
-        let home = dirs::home_dir().ok_or_else(|| Error::other("no home directory"))?;
-        let (rel, keyring_app) = match browser.to_ascii_lowercase().as_str() {
-            "chrome" => (
-                ".config/google-chrome",
-                "Chrome Safe Storage",
-            ),
-            "brave" => (
-                ".config/BraveSoftware/Brave-Browser",
-                "Brave Safe Storage",
-            ),
-            "chromium" => (".config/chromium", "Chromium Safe Storage"),
-            "edge" => (
-                ".config/microsoft-edge",
-                "Edge Safe Storage",
-            ),
-            other => return Err(Error::other(format!("unknown browser `{other}`"))),
+        let name = browser.to_ascii_lowercase();
+        // (profile folder relative to the OS data directory, keyring entry)
+        let (rel, keyring_app) = match (cfg!(windows), cfg!(target_os = "macos"), name.as_str()) {
+            (true, _, "chrome") => ("Google/Chrome/User Data", "Chrome Safe Storage"),
+            (true, _, "brave") => ("BraveSoftware/Brave-Browser/User Data", "Brave Safe Storage"),
+            (true, _, "chromium") => ("Chromium/User Data", "Chromium Safe Storage"),
+            (true, _, "edge") => ("Microsoft/Edge/User Data", "Edge Safe Storage"),
+            (_, true, "chrome") => ("Google/Chrome", "Chrome Safe Storage"),
+            (_, true, "brave") => ("BraveSoftware/Brave-Browser", "Brave Safe Storage"),
+            (_, true, "chromium") => ("Chromium", "Chromium Safe Storage"),
+            (_, true, "edge") => ("Microsoft Edge", "Microsoft Edge Safe Storage"),
+            (_, _, "chrome") => ("google-chrome", "Chrome Safe Storage"),
+            (_, _, "brave") => ("BraveSoftware/Brave-Browser", "Brave Safe Storage"),
+            (_, _, "chromium") => ("chromium", "Chromium Safe Storage"),
+            (_, _, "edge") => ("microsoft-edge", "Edge Safe Storage"),
+            (_, _, other) => return Err(Error::other(format!("unknown browser `{other}`"))),
         };
 
-        let root = home.join(rel);
+        // %LOCALAPPDATA% on Windows, ~/Library/Application Support on macOS,
+        // ~/.config on Linux.
+        let base = if cfg!(windows) {
+            dirs::data_local_dir()
+        } else {
+            dirs::config_dir()
+        }
+        .ok_or_else(|| Error::other("no application data directory"))?;
+
+        let root = base.join(rel);
         if !root.exists() {
             return Err(Error::other(format!(
                 "no {browser} profile found at {}",
@@ -96,8 +108,36 @@ impl BrowserProfile {
     }
 }
 
-/// Ask the OS keyring for the browser's encryption password.
+/// The keys needed to decrypt a browser's cookies.
+enum Keys {
+    /// Linux and macOS: AES-128-CBC.
+    Cbc {
+        v10: [u8; 16],
+        v11: Option<[u8; 16]>,
+    },
+    /// Windows: AES-256-GCM.
+    Gcm([u8; 32]),
+}
+
+/// Ask the OS keyring (Linux) or Keychain (macOS) for the password.
 fn keyring_password(app: &str) -> Result<Vec<u8>> {
+    if cfg!(target_os = "macos") {
+        let output = Command::new("security")
+            .args(["find-generic-password", "-w", "-s", app])
+            .output()
+            .map_err(|e| Error::other(format!("cannot run `security` to reach the Keychain: {e}")))?;
+        if !output.status.success() {
+            return Err(Error::other(format!(
+                "the Keychain has no entry for `{app}` (was access denied?)"
+            )));
+        }
+        let mut pw = output.stdout;
+        while pw.last() == Some(&b'\n') {
+            pw.pop();
+        }
+        return Ok(pw);
+    }
+
     let output = Command::new("secret-tool")
         .args(["lookup", "application", app])
         .output()
@@ -116,12 +156,10 @@ fn keyring_password(app: &str) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-/// PBKDF2-HMAC-SHA1, 1 iteration — Chromium's (deliberately weak) KDF.
-fn pbkdf2_sha1(password: &[u8], salt: &[u8]) -> [u8; 16] {
+/// PBKDF2-HMAC-SHA1 — Chromium's (deliberately weak) KDF.
+fn pbkdf2_sha1(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 16] {
     let mut key = [0u8; 16];
-    // One iteration, so this is cheap; Chromium uses it to stretch the
-    // keyring password into a 16 byte AES key.
-    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password, salt, 1, &mut key);
+    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password, salt, iterations, &mut key);
     key
 }
 
@@ -149,48 +187,103 @@ fn decrypt_v11(encrypted_key_b64: &str, password: &[u8]) -> Result<[u8; 16]> {
     Ok(key)
 }
 
-/// The AES key for `v10` cookies.
+/// The AES key for `v10` cookies on Linux (1 iteration) and macOS (1003).
 fn v10_key(password: &[u8]) -> [u8; 16] {
-    pbkdf2_sha1(password, SALT)
+    let iterations = if cfg!(target_os = "macos") { 1003 } else { 1 };
+    pbkdf2_sha1(password, SALT, iterations)
 }
 
-/// Decrypt a single cookie value, given both possible keys.
-fn decrypt_value(
-    encrypted: &[u8],
-    v10: Option<&[u8; 16]>,
-    v11: Option<&[u8; 16]>,
-) -> Result<Vec<u8>> {
+/// Unwrap the DPAPI-protected AES key in `Local State` (Windows).
+///
+/// DPAPI has no safe-Rust binding in our dependency set, so PowerShell does
+/// the call. The blob goes in as base64, so nothing can be injected.
+fn windows_key(local_state: &Path) -> Result<[u8; 32]> {
+    use base64::Engine;
+    let b64 = read_local_state_key(local_state)
+        .ok_or_else(|| Error::other("no os_crypt.encrypted_key in Local State"))?;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| Error::other(format!("bad encrypted_key in Local State: {e}")))?;
+    let blob = raw
+        .strip_prefix(b"DPAPI")
+        .ok_or_else(|| Error::other("the browser key is not DPAPI protected"))?;
+    let blob_b64 = base64::engine::general_purpose::STANDARD.encode(blob);
+
+    let script = format!(
+        "Add-Type -AssemblyName System.Security; \
+         $b=[Convert]::FromBase64String('{blob_b64}'); \
+         [Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Unprotect(\
+         $b,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser))"
+    );
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|e| Error::other(format!("cannot run PowerShell to unwrap the key: {e}")))?;
+    if !output.status.success() {
+        return Err(Error::other("DPAPI could not unwrap the browser key"));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let key = base64::engine::general_purpose::STANDARD
+        .decode(text.trim())
+        .map_err(|e| Error::other(format!("bad DPAPI output: {e}")))?;
+    key.try_into()
+        .map_err(|_| Error::other("the browser key has the wrong length"))
+}
+
+/// Why a value could not be decrypted.
+enum Skip {
+    /// `v20` app-bound encryption: only Chrome itself can read it.
+    AppBound,
+    Other,
+}
+
+/// Decrypt a single cookie value.
+fn decrypt_value(encrypted: &[u8], host: &str, keys: &Keys) -> std::result::Result<Vec<u8>, Skip> {
     if encrypted.is_empty() {
         return Ok(Vec::new());
     }
-    if encrypted.starts_with(b"v10") {
-        let key = v10.ok_or_else(|| Error::other("no v10 key available"))?;
-        let body = &encrypted[3..];
-        let mut buf = body.to_vec();
-        let dec = Aes128CbcDec::new_from_slices(key, IV)
-            .map_err(|_| Error::other("bad key length"))?;
-        let plain = dec
-            .decrypt_padded_mut::<Pkcs7>(&mut buf)
-            .map_err(|_| Error::other("cookie decryption failed (wrong key)"))?;
-        return Ok(plain[3..].to_vec());
-    }
-    if encrypted.starts_with(b"v11") {
-        let key = v11.ok_or_else(|| Error::other("no v11 key available"))?;
-        let body = &encrypted[3..];
-        let mut buf = body.to_vec();
-        let dec = Aes128CbcDec::new_from_slices(key, IV)
-            .map_err(|_| Error::other("bad key length"))?;
-        let plain = dec
-            .decrypt_padded_mut::<Pkcs7>(&mut buf)
-            .map_err(|_| Error::other("cookie decryption failed (wrong key)"))?;
-        return Ok(plain[3..].to_vec());
-    }
     if encrypted.starts_with(b"v20") {
-        return Err(Error::other(
-            "v20 (app-bound) cookies are not supported — this is a Windows-only scheme",
-        ));
+        return Err(Skip::AppBound);
     }
-    Err(Error::other("unknown cookie encryption version"))
+    let body = encrypted.get(3..).ok_or(Skip::Other)?;
+    let plain = match (keys, &encrypted[..3]) {
+        (Keys::Cbc { v10, .. }, b"v10") => cbc_decrypt(body, v10)?,
+        (Keys::Cbc { v11: Some(k), .. }, b"v11") => cbc_decrypt(body, k)?,
+        (Keys::Gcm(key), b"v10") => gcm_decrypt(body, key)?,
+        _ => return Err(Skip::Other),
+    };
+    Ok(strip_host_hash(plain, host))
+}
+
+fn cbc_decrypt(body: &[u8], key: &[u8; 16]) -> std::result::Result<Vec<u8>, Skip> {
+    let mut buf = body.to_vec();
+    let dec = Aes128CbcDec::new_from_slices(key, IV).map_err(|_| Skip::Other)?;
+    dec.decrypt_padded_mut::<Pkcs7>(&mut buf)
+        .map(|p| p.to_vec())
+        .map_err(|_| Skip::Other)
+}
+
+/// `nonce (12) || ciphertext || tag (16)`.
+fn gcm_decrypt(body: &[u8], key: &[u8; 32]) -> std::result::Result<Vec<u8>, Skip> {
+    use aes_gcm::aead::Aead;
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+    if body.len() < 12 + 16 {
+        return Err(Skip::Other);
+    }
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| Skip::Other)?;
+    cipher
+        .decrypt(Nonce::from_slice(&body[..12]), &body[12..])
+        .map_err(|_| Skip::Other)
+}
+
+/// Newer Chromium prepends SHA-256(host_key) to the plaintext value.
+fn strip_host_hash(plain: Vec<u8>, host: &str) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    if plain.len() >= 32 && plain[..32] == Sha256::digest(host.as_bytes())[..] {
+        plain[32..].to_vec()
+    } else {
+        plain
+    }
 }
 
 /// Read and decrypt every cookie of a Chromium browser.
@@ -200,20 +293,32 @@ pub fn chromium_cookies(browser: &str) -> Result<Vec<BrowserCookie>> {
         .cookies_db()
         .ok_or_else(|| Error::other("no Cookies database found (browser never ran?)"))?;
 
-    // The keyring password is needed for both schemes.
-    let password = keyring_password(&profile.keyring_app)?;
-
-    // v11 key, if the browser stores one.
-    let v11 = match profile.local_state() {
-        Some(path) => read_local_state_key(&path)
-            .and_then(|b64| decrypt_v11(&b64, &password).ok()),
-        None => None,
+    let keys = if cfg!(windows) {
+        let local_state = profile
+            .local_state()
+            .ok_or_else(|| Error::other("no Local State file found"))?;
+        Keys::Gcm(windows_key(&local_state)?)
+    } else {
+        let password = keyring_password(&profile.keyring_app)?;
+        let v11 = match profile.local_state() {
+            Some(path) => {
+                read_local_state_key(&path).and_then(|b64| decrypt_v11(&b64, &password).ok())
+            }
+            None => None,
+        };
+        Keys::Cbc {
+            v10: v10_key(&password),
+            v11,
+        }
     };
-    let v10 = v10_key(&password);
 
     // Chromium keeps the database locked while the browser runs; copy it.
     let tmp = tempdir_path();
-    std::fs::copy(&db, &tmp)?;
+    std::fs::copy(&db, &tmp).map_err(|e| {
+        Error::other(format!(
+            "cannot copy the cookie database ({e}); close {browser} completely and try again"
+        ))
+    })?;
 
     let conn = Connection::open(&tmp)?;
     let mut stmt = conn.prepare(
@@ -222,14 +327,20 @@ pub fn chromium_cookies(browser: &str) -> Result<Vec<BrowserCookie>> {
     )?;
 
     let mut out = Vec::new();
+    let mut app_bound = 0usize;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
+        let host: String = row.get(0)?;
         let plain_value: String = row.get(4)?;
         let encrypted: Vec<u8> = row.get(5)?;
         let value = if plain_value.is_empty() && !encrypted.is_empty() {
-            match decrypt_value(&encrypted, Some(&v10), v11.as_ref()) {
+            match decrypt_value(&encrypted, &host, &keys) {
                 Ok(v) => String::from_utf8_lossy(&v).to_string(),
-                Err(_) => continue,
+                Err(Skip::AppBound) => {
+                    app_bound += 1;
+                    continue;
+                }
+                Err(Skip::Other) => continue,
             }
         } else {
             plain_value
@@ -237,7 +348,7 @@ pub fn chromium_cookies(browser: &str) -> Result<Vec<BrowserCookie>> {
 
         let expires_raw: i64 = row.get(6)?;
         out.push(BrowserCookie {
-            domain: row.get(0)?,
+            domain: host,
             path: row.get(1)?,
             secure: row.get::<_, i64>(2)? != 0,
             name: row.get(3)?,
@@ -245,8 +356,21 @@ pub fn chromium_cookies(browser: &str) -> Result<Vec<BrowserCookie>> {
             expires: chromium_timestamp(expires_raw),
         });
     }
-
+    drop(rows);
+    drop(stmt);
+    drop(conn);
     let _ = std::fs::remove_file(&tmp);
+
+    if out.is_empty() && app_bound > 0 {
+        return Err(Error::other(format!(
+            "{browser} uses app-bound (v20) cookie encryption, which only the browser itself \
+             can read. Export a cookies.txt with a browser extension and use --cookies, \
+             or use --cookies-from-browser firefox"
+        )));
+    }
+    if app_bound > 0 {
+        eprintln!("note: skipped {app_bound} app-bound (v20) cookies that cannot be decrypted");
+    }
     Ok(out)
 }
 
@@ -271,8 +395,14 @@ fn read_local_state_key(path: &Path) -> Option<String> {
 
 /// Firefox stores cookies in `cookies.sqlite` **unencrypted**.
 pub fn firefox_cookies() -> Result<Vec<BrowserCookie>> {
-    let home = dirs::home_dir().ok_or_else(|| Error::other("no home directory"))?;
-    let root = home.join(".mozilla/firefox");
+    let root = if cfg!(windows) {
+        dirs::data_dir().map(|d| d.join("Mozilla").join("Firefox").join("Profiles"))
+    } else if cfg!(target_os = "macos") {
+        dirs::data_dir().map(|d| d.join("Firefox").join("Profiles"))
+    } else {
+        dirs::home_dir().map(|d| d.join(".mozilla").join("firefox"))
+    }
+    .ok_or_else(|| Error::other("no home directory"))?;
     if !root.exists() {
         return Err(Error::other("no Firefox profile found"));
     }
@@ -285,6 +415,12 @@ pub fn firefox_cookies() -> Result<Vec<BrowserCookie>> {
             profiles.push(path);
         }
     }
+    // The everyday profile is the one called `*.default-release`.
+    profiles.sort_by_key(|p| {
+        !p.file_name()
+            .map(|n| n.to_string_lossy().ends_with("default-release"))
+            .unwrap_or(false)
+    });
     let profile = profiles
         .into_iter()
         .next()
@@ -410,23 +546,52 @@ mod tests {
         use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
         type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 
-        let password = b"hunter2";
-        let key = v10_key(password);
+        let key = v10_key(b"hunter2");
         let plaintext = b"cookie-value-1234";
 
-        // Chromium encrypts "v10" + value with PKCS#7 padding.
+        // Chromium stores "v10" + AES(value); the prefix is not encrypted.
         let mut buf = vec![0u8; 32];
-        buf[..3].copy_from_slice(b"v10");
-        buf[3..3 + plaintext.len()].copy_from_slice(plaintext);
-
+        buf[..plaintext.len()].copy_from_slice(plaintext);
         let enc = Aes128CbcEnc::new_from_slices(&key, IV).unwrap();
-        let len = 3 + plaintext.len();
-        let cipher = enc.encrypt_padded_mut::<Pkcs7>(&mut buf, len).unwrap();
+        let cipher = enc.encrypt_padded_mut::<Pkcs7>(&mut buf, plaintext.len()).unwrap();
 
-        let mut with_prefix = b"v10".to_vec();
-        with_prefix.extend_from_slice(cipher);
+        let mut stored = b"v10".to_vec();
+        stored.extend_from_slice(cipher);
 
-        let out = decrypt_value(&with_prefix, Some(&key), None).unwrap();
+        let keys = Keys::Cbc { v10: key, v11: None };
+        let out = decrypt_value(&stored, ".youtube.com", &keys).ok().unwrap();
         assert_eq!(out, plaintext);
+    }
+
+    #[test]
+    fn gcm_round_trip_with_host_hash() {
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        use sha2::{Digest, Sha256};
+
+        let key = [7u8; 32];
+        let host = ".youtube.com";
+        let mut plain = Sha256::digest(host.as_bytes()).to_vec();
+        plain.extend_from_slice(b"secret");
+
+        let nonce = [1u8; 12];
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let ct = cipher.encrypt(Nonce::from_slice(&nonce), plain.as_slice()).unwrap();
+
+        let mut stored = b"v10".to_vec();
+        stored.extend_from_slice(&nonce);
+        stored.extend_from_slice(&ct);
+
+        let out = decrypt_value(&stored, host, &Keys::Gcm(key)).ok().unwrap();
+        assert_eq!(out, b"secret");
+    }
+
+    #[test]
+    fn app_bound_cookies_are_reported() {
+        let keys = Keys::Gcm([0u8; 32]);
+        assert!(matches!(
+            decrypt_value(b"v20abcdef", ".x.com", &keys),
+            Err(Skip::AppBound)
+        ));
     }
 }

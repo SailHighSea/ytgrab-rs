@@ -122,8 +122,53 @@ pub fn solve_n_challenges_preprocessed(
     formats: &mut [Format],
     preprocessed: &str,
 ) -> Result<()> {
+    // Formats that come as a `signatureCipher` get their URL first; the `n`
+    // challenge in that URL is solved afterwards.
+    decode_signature_ciphers(formats, preprocessed)?;
     let solved = crate::js::solve_preprocessed(preprocessed, &challenges_of(formats))?;
     apply_solutions(formats, solved);
+    Ok(())
+}
+
+/// Split a `signatureCipher` into its URL, the signature to solve and the
+/// query parameter the answer goes into.
+pub fn parse_cipher(cipher: &str) -> Option<(String, String, String)> {
+    let (mut url, mut s, mut sp) = (None, None, None);
+    for (k, v) in url::form_urlencoded::parse(cipher.as_bytes()) {
+        match k.as_ref() {
+            "url" => url = Some(v.into_owned()),
+            "s" => s = Some(v.into_owned()),
+            "sp" => sp = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+    Some((url?, s?, sp.unwrap_or_else(|| "signature".to_string())))
+}
+
+/// Give every format that only has a `signatureCipher` a playable URL.
+fn decode_signature_ciphers(formats: &mut [Format], preprocessed: &str) -> Result<()> {
+    let parsed: Vec<(usize, String, String, String)> = formats
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.url.is_none())
+        .filter_map(|(i, f)| {
+            let (url, s, sp) = parse_cipher(f.signature_cipher.as_deref()?)?;
+            Some((i, url, s, sp))
+        })
+        .collect();
+    if parsed.is_empty() {
+        return Ok(());
+    }
+    let challenges: Vec<String> = parsed.iter().map(|(_, _, s, _)| s.clone()).collect();
+    let solved = crate::js::solve_signatures(preprocessed, &challenges)?;
+    for ((i, url, _, sp), value) in parsed.into_iter().zip(solved) {
+        let mut u = match url::Url::parse(&url) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        u.query_pairs_mut().append_pair(&sp, &value);
+        formats[i].url = Some(u.to_string());
+    }
     Ok(())
 }
 
@@ -162,6 +207,16 @@ mod tests {
         assert_eq!(n_challenge(&solved).as_deref(), Some("solved"));
         assert!(solved.contains("itag=137"));
         assert!(solved.contains("sig=xyz"));
+    }
+
+    #[test]
+    fn splits_a_signature_cipher() {
+        let c = "s=AB%3DCD&sp=sig&url=https%3A%2F%2Fa.example%2Fv%3Fx%3D1";
+        let (url, s, sp) = parse_cipher(c).unwrap();
+        assert_eq!(url, "https://a.example/v?x=1");
+        assert_eq!(s, "AB=CD");
+        assert_eq!(sp, "sig");
+        assert!(parse_cipher("sp=sig").is_none());
     }
 
     #[test]

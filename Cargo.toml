@@ -42,6 +42,8 @@ cbc = { version = "0.1", features = ["alloc"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 hmac = "0.12"
 sha1 = "0.10"
+sha2 = "0.10"
+aes-gcm = "0.10"
 base64 = "0.22"
 rquickjs = "0.14"
 

@@ -592,9 +592,33 @@ fn lock_owner(path: &Path) -> Option<u32> {
     content.trim().parse::<u32>().ok()
 }
 
-/// Is this process still running? Linux only, but that is where we run.
+/// Is this process still running?
 fn process_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+    if cfg!(target_os = "linux") {
+        return Path::new(&format!("/proc/{pid}")).exists();
+    }
+    if cfg!(windows) {
+        // `tasklist` prints a CSV row with the pid when the filter matches
+        // and a "No tasks" notice when it does not.
+        let want = pid.to_string();
+        return std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|l| l.split(',').nth(1).map(|f| f.trim_matches('"')) == Some(want.as_str()))
+            })
+            // If we cannot tell, assume it is alive: refusing is safer than
+            // two writers corrupting one file.
+            .unwrap_or(true);
+    }
+    // macOS and other Unix: signal 0 checks existence without sending anything.
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(true)
 }
 
 impl Drop for LockFile {

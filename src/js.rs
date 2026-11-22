@@ -64,6 +64,15 @@ pub fn preprocess_player(player_js: &str) -> Result<(String, String)> {
 
 /// Solve challenges with an already preprocessed player.
 pub fn solve_preprocessed(preprocessed: &str, challenges: &[String]) -> Result<Vec<String>> {
+    solve_kind(preprocessed, "n", challenges)
+}
+
+/// Solve signature (`sig`) challenges: the `s` value of a `signatureCipher`.
+pub fn solve_signatures(preprocessed: &str, challenges: &[String]) -> Result<Vec<String>> {
+    solve_kind(preprocessed, "sig", challenges)
+}
+
+fn solve_kind(preprocessed: &str, kind: &str, challenges: &[String]) -> Result<Vec<String>> {
     if challenges.is_empty() {
         return Ok(Vec::new());
     }
@@ -73,7 +82,7 @@ pub fn solve_preprocessed(preprocessed: &str, challenges: &[String]) -> Result<V
         "type": "preprocessed",
         "preprocessed_player": preprocessed,
         "requests": [{
-            "type": "n",
+            "type": kind,
             "challenges": challenges,
         }],
     });
